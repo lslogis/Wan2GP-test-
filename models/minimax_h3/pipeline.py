@@ -14,11 +14,11 @@ from PIL import Image
 from tqdm import tqdm
 
 from mmgp import offload
-from shared.utils.loras_mutipliers import extract_loras_side, update_loras_slists
+from shared.utils.loras_mutipliers import extract_loras_side, parse_loras_multipliers, update_loras_slists
 from shared.utils.text_encoder_cache import TextEncoderCache
 from shared.utils.phase_progress import control_video_encoding, generation_progress
 from shared.utils.utils import guide_mask_to_float, guide_to_float
-from shared.utils.frame_scheduler import floor_frame_count, normalize_frame_count, normalize_overlap
+from shared.utils.frame_scheduler import SLASH_BLOCK_RE, floor_frame_count, normalize_frame_count, normalize_overlap
 from shared.utils.utils import convert_video_tensor_to_uint8_chunked
 from .constants import (H3_AUDIO_REFINEMENT_DENOISE, H3_AUDIO_REFINEMENT_SETTING, H3_AUDIO_REFINEMENT_STEPS, H3_CONTROL_LATENT_CONTINUATION,
                         H3_PHASE_2_NOISE_LEVEL_START_DEFAULT, H3_REGENERATE_LORA, h3_grouped_masking_enabled)
@@ -46,6 +46,8 @@ SOL_ATTN_TAU_END = 0.8
 H3_TWO_PHASE_SCALE = 2.0
 H3_PHASE_2_SIGMAS = (H3_PHASE_2_NOISE_LEVEL_START_DEFAULT, 0.6316, 0.3158, 0.0)
 H3_PHASE_2_SAMPLE_SOLVER = "euler"
+# Keep phase-1 audio as frozen conditioning; True restores Regenerate's silent conditioning.
+H3_REGENERATE_SILENT_AUDIO = False
 H3_PHASE_2_TILE_COUNT = 4
 H3_PHASE_2_TILE_OVERLAP_RATIO = 0.25
 H3_PHASE_2_TILE_ALIGNMENT = 32
@@ -435,7 +437,7 @@ class MiniMaxH3Pipeline:
         return torch.device("cuda" if torch.cuda.is_available() else next(self.transformer.parameters()).device)
 
     def get_loras_transformer(self, _get_model_recursive_prop, model_type, model_def, guidance_phases, activated_loras,
-                              loras_multipliers="", transformer_loras_filenames=(), **_kwargs):
+                              loras_multipliers="", transformer_loras_filenames=(), num_inference_steps=1, prompts=(), **_kwargs):
         self._phase_2_loras = None
         if int(guidance_phases) > 1 and not model_def.get("pdd", False):
             accelerator_loras, _ = extract_loras_side(activated_loras, loras_multipliers)
@@ -451,6 +453,15 @@ class MiniMaxH3Pipeline:
             return [turbo_lora], ["0;1" if selected_vdn else "1;1"]
         if self._phase_2_loras is None:
             return [], []
+        # Window overrides can turn the accelerator off later, requiring the default again.
+        window_overrides = any("loras_mult" in match.group(1).lower() for prompt in prompts for match in SLASH_BLOCK_RE.finditer(prompt))
+        if accelerator_loras and not window_overrides:
+            _, slists, error = parse_loras_multipliers(loras_multipliers, len(activated_loras), num_inference_steps, nb_phases=guidance_phases)
+            if error:
+                raise ValueError(f"Error parsing Loras: {error}")
+            if any(value != 0 for multiplier in slists["phase2"][:len(accelerator_loras)] for value in (multiplier if isinstance(multiplier, list) else [multiplier])):
+                self._phase_2_loras = None
+                return [], []
         return [model_def[H3_TURBO_LORA_KEY]], ["0;1"]
 
     def get_trans_lora(self):
@@ -1515,7 +1526,7 @@ class MiniMaxH3Pipeline:
                 regenerate = any(value != 0 for value in (multiplier if isinstance(multiplier, list) else [multiplier]))
                 if regenerate:
                     break
-            if regenerate:
+            if regenerate and H3_REGENERATE_SILENT_AUDIO:
                 if set_progress_status is not None:
                     set_progress_status("Encoding Silent Audio for Phase 2")
                 saved_phase_1_audio = audio
